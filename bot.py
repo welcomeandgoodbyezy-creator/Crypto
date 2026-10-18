@@ -23,7 +23,7 @@ SYMBOL_PRIORITY = [
     ('AXSUSDT', 1.0)
 ]
 
-BASE_URL = 'https://fapi.binance.com'
+BASE_URL = 'https://api.binance.com' 
 
 def get_balance():
     params = {'timestamp': int(time.time()*1000)}
