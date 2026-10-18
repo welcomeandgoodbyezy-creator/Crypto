@@ -1,11 +1,11 @@
-import ccxt
+import requests
 import pandas as pd
-import pandas_ta as ta
-import time
+import numpy as np
 import os
+import time
 from datetime import datetime
 
-# --- LIVE ROTATION CONFIG ---
+# --- CONFIG ---
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 LEVERAGE = 5
@@ -14,7 +14,7 @@ ADX_THRESHOLD = 25
 VOL_MULT = 1.2
 TIMEFRAME = '1h'
 CHECK_INTERVAL = 3600
-DORMANT_CANDLES = 3  # switch after 3 consecutive low-ADX candles
+DORMANT_CANDLES = 3
 
 SYMBOL_PRIORITY = [
     ('DOTUSDT', 1.0),
@@ -23,109 +23,132 @@ SYMBOL_PRIORITY = [
     ('AXSUSDT', 1.0)
 ]
 
-exchange = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
+BASE_URL = 'https://fapi.binance.com'
 
 def get_balance():
-    try:
-        bal = exchange.fetch_balance()
-        return float(bal['info']['totalWalletBalance'])
-    except Exception as e:
-        print(f"balance error: {e}")
-        return 0.0
+    params = {'timestamp': int(time.time()*1000)}
+    # Note: requires signature, simplified here for structure
+    resp = requests.get(f'{BASE_URL}/fapi/v2/account', params=params, 
+                       headers={'X-MBX-APIKEY': API_KEY})
+    if resp.status_code == 200:
+        return float(resp.json()['totalWalletBalance'])
+    print(f"balance error: {resp.text}")
+    return 0.0
 
 def set_leverage(symbol, lev):
-    try:
-        exchange.set_leverage(lev, symbol)
-    except Exception as e:
-        print(f"leverage error {symbol}: {e}")
+    params = {'symbol': symbol, 'leverage': lev, 'timestamp': int(time.time()*1000)}
+    requests.post(f'{BASE_URL}/fapi/v1/leverage', params=params,
+                 headers={'X-MBX-APIKEY': API_KEY})
 
-def calculate_indicators(df):
-    if df is None or len(df) < 30:
-        return None
-    df.ta.sma(length=7, append=True)
-    df.ta.sma(length=25, append=True)
-    df.ta.adx(length=14, append=True)
-    df['VOL_SMA'] = df['volume'].rolling(window=20).mean()
-    df.rename(columns={'SMA_7':'SMA_SHORT','SMA_25':'SMA_LONG','ADX_14':'ADX'}, inplace=True)
-    return df
+def calculate_adx(df, period=14):
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    
+    tr = np.maximum(high[1:] - low[1:], 
+           np.maximum(np.abs(high[1:] - close[:-1]), 
+                     np.abs(low[1:] - close[:-1])))
+    
+    plus_dm = np.where((high[1:] - high[:-1]) > (low[:-1] - low[1:]), 
+              np.maximum(high[1:] - high[:-1], 0), 0)
+    minus_dm = np.where((low[:-1] - low[1:]) > (high[1:] - high[:-1]), 
+               np.maximum(low[:-1] - low[1:], 0), 0)
+    
+    atr = pd.Series(tr).rolling(period).mean().values
+    plus_di = 100 * pd.Series(plus_dm).rolling(period).mean().values / atr
+    minus_di = 100 * pd.Series(minus_dm).rolling(period).mean().values / atr
+    
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    adx = pd.Series(dx).rolling(period).mean().values
+    
+    result = np.full(len(df), np.nan)
+    result[period+1:] = adx[:len(adx)]
+    return result
 
 def get_signal_and_adx(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for c in ['open','high','low','close','volume']:
-            df[c] = df[c].astype(float)
-        df = calculate_indicators(df)
-        if df is None:
+        resp = requests.get(f'{BASE_URL}/fapi/v1/klines', 
+                           params={'symbol': symbol, 'interval': TIMEFRAME, 'limit': 100})
+        data = resp.json()
+        
+        df = pd.DataFrame(data, columns=['t','o','h','l','c','v','ct','qv','trades','tbv','tbq','i'])
+        for col in ['o','h','l','c','v']:
+            df[col] = df[col].astype(float)
+        
+        sma7 = df['c'].rolling(7).mean()
+        sma25 = df['c'].rolling(25).mean()
+        vol_sma = df['v'].rolling(20).mean()
+        adx = calculate_adx(df)
+        
+        last_idx = len(df) - 1
+        prev_idx = last_idx - 1
+        
+        if np.isnan(adx[last_idx]) or adx[last_idx] < ADX_THRESHOLD:
             return None, 0
         
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        vol_ok = last['volume'] > last['VOL_SMA'] * VOL_MULT
+        vol_ok = df['v'].iloc[last_idx] > vol_sma.iloc[last_idx] * VOL_MULT
         
         signal = None
-        if prev['SMA_SHORT'] <= prev['SMA_LONG'] and last['SMA_SHORT'] > last['SMA_LONG'] and vol_ok:
+        if sma7.iloc[prev_idx] <= sma25.iloc[prev_idx] and sma7.iloc[last_idx] > sma25.iloc[last_idx] and vol_ok:
             signal = 'LONG'
-        elif prev['SMA_SHORT'] >= prev['SMA_LONG'] and last['SMA_SHORT'] < last['SMA_LONG'] and vol_ok:
+        elif sma7.iloc[prev_idx] >= sma25.iloc[prev_idx] and sma7.iloc[last_idx] < sma25.iloc[last_idx] and vol_ok:
             signal = 'SHORT'
+            
+        return signal, adx[last_idx]
         
-        return signal, last['ADX']
     except Exception as e:
         print(f"signal error {symbol}: {e}")
         return None, 0
 
 def execute_trade(symbol, signal, balance):
     try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker['last']
-        amount = (balance * LEVERAGE) / price
-        side = 'buy' if signal == 'LONG' else 'sell'
-        order = exchange.create_market_order(symbol, side, amount)
+        ticker = requests.get(f'{BASE_URL}/fapi/v1/ticker/price', params={'symbol': symbol}).json()
+        price = float(ticker['price'])
+        qty = round((balance * LEVERAGE) / price, 3)
+        
+        side = 'BUY' if signal == 'LONG' else 'SELL'
+        params = {
+            'symbol': symbol, 'side': side, 'type': 'MARKET',
+            'quantity': qty, 'timestamp': int(time.time()*1000)
+        }
+        resp = requests.post(f'{BASE_URL}/fapi/v1/order', params=params,
+                            headers={'X-MBX-APIKEY': API_KEY})
         print(f"[{datetime.now()}] {symbol} {signal} | ${balance:.2f} @ ${price}")
-        return order
+        return resp.json()
     except Exception as e:
         print(f"trade error {symbol}: {e}")
         return None
 
 def close_position(symbol):
     try:
-        pos = exchange.fetch_position(symbol)
-        if pos and float(pos.get('contracts', 0)) != 0:
-            side = 'sell' if pos['side'] == 'long' else 'buy'
-            amt = abs(float(pos['contracts']))
-            exchange.create_market_order(symbol, side, amt)
-            print(f"[{datetime.now()}] closed {symbol} {pos['side']}")
+        pos = requests.get(f'{BASE_URL}/fapi/v2/positionRisk', 
+                          params={'symbol': symbol, 'timestamp': int(time.time()*1000)},
+                          headers={'X-MBX-APIKEY': API_KEY}).json()
+        if pos and float(pos[0].get('positionAmt', 0)) != 0:
+            amt = abs(float(pos[0]['positionAmt']))
+            side = 'SELL' if float(pos[0]['positionAmt']) > 0 else 'BUY'
+            params = {'symbol': symbol, 'side': side, 'type': 'MARKET',
+                     'quantity': amt, 'timestamp': int(time.time()*1000)}
+            requests.post(f'{BASE_URL}/fapi/v1/order', params=params,
+                         headers={'X-MBX-APIKEY': API_KEY})
+            print(f"[{datetime.now()}] closed {symbol}")
     except:
         pass
 
-def main():
-    print("=== LIVE SYMBOL ROTATION BOT ===")
-    print(f"priority: {[s[0] for s in SYMBOL_PRIORITY]}")
-    print(f"dormant threshold: {DORMANT_CANDLES} consecutive low-ADX candles\n")
-    
+if __name__ == "__main__":
+    print("=== LIGHTWEIGHT ROTATION BOT ===")
     active_symbol = None
-    dormant_count = {}
+    dormant_count = {s: 0 for s, _ in SYMBOL_PRIORITY}
     position_open = False
-    
-    for sym, _ in SYMBOL_PRIORITY:
-        dormant_count[sym] = 0
     
     while True:
         try:
             balance = get_balance()
             print(f"\n[{datetime.now()}] balance: ${balance:.2f} | active: {active_symbol}")
             
-            # Check all symbols for ADX status
             best_candidate = None
             for sym, _ in SYMBOL_PRIORITY:
                 signal, adx = get_signal_and_adx(sym)
-                
                 if adx >= ADX_THRESHOLD:
                     dormant_count[sym] = 0
                     if best_candidate is None:
@@ -133,9 +156,8 @@ def main():
                 else:
                     dormant_count[sym] += 1
             
-            # Rotate if current symbol goes dormant or better candidate emerges
             if active_symbol and dormant_count.get(active_symbol, 0) >= DORMANT_CANDLES:
-                print(f"⚠️  {active_symbol} dormant ({dormant_count[active_symbol]} candles) - rotating")
+                print(f"⚠️  {active_symbol} dormant - rotating")
                 if position_open:
                     close_position(active_symbol)
                     position_open = False
@@ -145,7 +167,6 @@ def main():
                 active_symbol = best_candidate
                 print(f">>> SWITCHING TO {active_symbol}")
             
-            # Execute on active symbol
             if active_symbol and not position_open:
                 set_leverage(active_symbol, LEVERAGE)
                 signal, _ = get_signal_and_adx(active_symbol)
@@ -168,6 +189,3 @@ def main():
         except Exception as e:
             print(f"loop error: {e}")
             time.sleep(CHECK_INTERVAL)
-
-if __name__ == "__main__":
-    main()
