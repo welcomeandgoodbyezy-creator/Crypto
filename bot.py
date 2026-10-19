@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import os
 import time
-import platform
 from datetime import datetime
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
@@ -32,17 +31,21 @@ if os.path.exists('/home/Zakkai') or os.environ.get('PYTHONANYWHERE_DOMAIN'):
     }
     print("[INFO] PythonAnywhere environment detected. Routing through proxy.")
 
-# Initialize CCXT with proxy if needed
+# Initialize CCXT with large recvWindow to prevent timestamp errors
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': API_SECRET,
-    'options': {'defaultType': 'future'},
+    'options': {
+        'defaultType': 'future',
+        'recvWindow': 60000  # 60-second window prevents clock drift errors
+    },
     'enableRateLimit': True,
     'proxies': proxies
 })
 
-# CRITICAL: Syncs local time with Binance server to fix clock drift
-exchange.load_time_difference()
+# REMOVED: exchange.load_time_difference()
+# PythonAnywhere's system clock is already accurate. 
+# This bypasses the geo-blocked /fapi/v1/time endpoint.
 
 def get_balance():
     try:
