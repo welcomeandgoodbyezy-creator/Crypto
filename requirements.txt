@@ -1,4 +1,5 @@
-ccxt==4.5.88
-pandas==2.2.2
-numpy==2.1.0
-requests==2.32.3
+cd C:\Users\emman\Desktop\Cypto
+echo ccxt==4.5.88 > requirements.txt
+echo pandas==2.2.2 >> requirements.txt
+echo numpy==2.1.0 >> requirements.txt
+echo requests==2.32.3 >> requirements.txt
