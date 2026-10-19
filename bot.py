@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import time
+import platform
 from datetime import datetime
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
@@ -22,15 +23,25 @@ DORMANT_CANDLES = 3
 
 SYMBOL_PRIORITY = ['DOTUSDT', 'MANAUSDT', 'SOLUSDT', 'AXSUSDT']
 
-# Initialize CCXT
+# Detect PythonAnywhere environment to apply mandatory proxy
+proxies = {}
+if os.path.exists('/home/Zakkai') or os.environ.get('PYTHONANYWHERE_DOMAIN'):
+    proxies = {
+        'http': 'http://proxy.server:3128',
+        'https': 'http://proxy.server:3128'
+    }
+    print("[INFO] PythonAnywhere environment detected. Routing through proxy.")
+
+# Initialize CCXT with proxy if needed
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': API_SECRET,
     'options': {'defaultType': 'future'},
-    'enableRateLimit': True
+    'enableRateLimit': True,
+    'proxies': proxies
 })
 
-# CRITICAL: Syncs local time with Binance server to fix your 2026 clock issue
+# CRITICAL: Syncs local time with Binance server to fix clock drift
 exchange.load_time_difference()
 
 def get_balance():
@@ -70,7 +81,6 @@ def calculate_adx(df, period=14):
 
 def get_signal_and_adx(symbol):
     try:
-        # ccxt fetch_ohlcv returns [timestamp, open, high, low, close, volume]
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
